@@ -8,6 +8,9 @@ import { createApp } from './src/server.mjs';
 const ENV_URL = (process.env.MAKEFUN_ENV_URL || '').replace(/\/+$/, '');
 const FIXED_PORT = Number(process.env.FORGE_PORT || 0);
 
+// How often to ask the env whether the trial is over. The answer only matters once, at the end.
+const DONE_POLL_MS = 500;
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function listen(server, port) {
@@ -52,7 +55,7 @@ async function waitForDone() {
     } catch {
       // not answering yet, or a slow poll: it is not done
     }
-    await sleep(500);
+    await sleep(DONE_POLL_MS);
   }
 }
 

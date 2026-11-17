@@ -4,6 +4,7 @@
 // next mutating request, which empties the cache.
 
 import net from 'node:net';
+import { writeSync } from 'node:fs';
 import { ApiError, afterPush, errorBody, findRepo, rest } from './forge.mjs';
 import { GitError, advertiseReceive, advertiseUploadV0, advertiseUploadV2, maybeGunzip, receivePack, uploadPack } from './git.mjs';
 import { graphqlHttp } from './graphql.mjs';
@@ -310,8 +311,39 @@ function serverError() {
   return jsonReply(500, { message: 'Server Error' });
 }
 
-function onData(socket, chunk) {
-  let data = socket.fgBuf === null ? chunk : Buffer.concat([socket.fgBuf, chunk]);
+// Writes a reply. A connection in fast mode (its fd is known and nothing is queued on the stream)
+// gets one write(2) straight from here; anything the kernel will not take goes through the stream.
+function send(socket, payload, closing) {
+  let rest = payload;
+  if (socket.fgFd >= 0 && socket.writableLength === 0) {
+    let written = 0;
+    try {
+      written = writeSync(socket.fgFd, payload);
+    } catch (err) {
+      if (err.code !== 'EAGAIN') {
+        socket.destroy();
+        return;
+      }
+    }
+    if (written >= payload.length) {
+      if (closing) socket.end();
+      return;
+    }
+    rest = payload.subarray(written);
+  }
+  if (closing) socket.end(rest);
+  else socket.write(rest);
+}
+
+// Feeds received bytes through the request parser. `borrowed` says `chunk` is a view of the shared
+// read buffer, which the next read overwrites: whatever must outlive this call is copied.
+function onData(socket, chunk, borrowed) {
+  let owned = !borrowed;
+  let data = chunk;
+  if (socket.fgBuf !== null) {
+    data = Buffer.concat([socket.fgBuf, chunk]);
+    owned = true;
+  }
   socket.fgBuf = null;
   let out = null;
   let outList = null;
@@ -403,31 +435,78 @@ function onData(socket, chunk) {
     data = consumed >= data.length ? Buffer.alloc(0) : data.subarray(consumed);
     if (closing) break;
   }
-  if (data.length > 0 && !closing) socket.fgBuf = data;
-  if (out !== null) {
-    const payload = outList === null ? out : Buffer.concat(outList);
-    if (closing) socket.end(payload);
-    else socket.write(payload);
+  if (data.length > 0 && !closing) socket.fgBuf = owned ? data : Buffer.from(data);
+  if (out !== null) send(socket, outList === null ? out : Buffer.concat(outList), closing);
+}
+
+function feed(socket, chunk, borrowed) {
+  try {
+    onData(socket, chunk, borrowed);
+  } catch {
+    try {
+      socket.end(serverError());
+    } catch {
+      socket.destroy();
+    }
   }
 }
 
+// One read buffer for every fast-mode connection. A read is parsed (and anything kept is copied)
+// before the next one lands, so the bytes never need a buffer of their own.
+const READ_BUFFER = Buffer.allocUnsafeSlow(64 * 1024);
+const FAST_IO = process.env.FORGE_FAST_IO !== '0';
+
+// Re-wraps an accepted connection so that reads land in READ_BUFFER (net's `onread` option, which a
+// server's own sockets cannot ask for) and replies can be written on the fd directly. On a sandboxed
+// kernel the buffer net allocates for every read, and the stream machinery around every write, cost
+// more than the request itself. Returns null when the handle cannot be taken over.
+function fastSocket(accepted) {
+  const tcp = accepted._handle;
+  if (tcp === null || tcp === undefined || typeof tcp.fd !== 'number' || tcp.fd < 0) return null;
+  const fd = tcp.fd;
+  accepted._handle = null;
+  const socket = new net.Socket({
+    handle: tcp,
+    onread: {
+      buffer: READ_BUFFER,
+      callback(size, buffer) {
+        feed(socket, size === buffer.length ? buffer : buffer.subarray(0, size), true);
+        return true;
+      },
+    },
+  });
+  socket.fgFd = fd;
+  socket.on('close', () => {
+    socket.fgFd = -1;
+  });
+  return socket;
+}
+
 export function createApp() {
-  const server = net.createServer({ noDelay: true, keepAlive: true }, (socket) => {
+  const server = net.createServer({ noDelay: true, pauseOnConnect: FAST_IO }, (accepted) => {
+    let socket = null;
+    if (FAST_IO) {
+      try {
+        socket = fastSocket(accepted);
+      } catch {
+        socket = null;
+      }
+    }
+    const fast = socket !== null;
+    if (!fast) {
+      socket = accepted;
+      socket.fgFd = -1;
+    }
     socket.fgBuf = null;
     socket.fgCont = false;
-    socket.setNoDelay(true);
-    socket.on('data', (chunk) => {
-      try {
-        onData(socket, chunk);
-      } catch {
-        try {
-          socket.end(serverError());
-        } catch {
-          socket.destroy();
-        }
-      }
-    });
     socket.on('error', () => socket.destroy());
+    if (fast) {
+      socket.setNoDelay(true);
+      socket.resume();
+    } else {
+      socket.on('data', (chunk) => feed(socket, chunk, false));
+      if (FAST_IO) socket.resume();
+    }
   });
   server.on('error', () => undefined);
   return server;

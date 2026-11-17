@@ -414,9 +414,11 @@ const SLAB_LIMIT = 16 * 1024;
 let slab = Buffer.allocUnsafeSlow(SLAB_SIZE);
 let slabUsed = 0;
 
+// Copies `bytes` into the slab (or, when large, into a buffer of their own) and returns the copy.
+// Callers may pass views of a request buffer that is about to be reused.
 function stash(bytes) {
   const n = bytes.length;
-  if (n > SLAB_LIMIT) return bytes;
+  if (n > SLAB_LIMIT) return Buffer.from(bytes);
   if (slabUsed + n > SLAB_SIZE) {
     slab = Buffer.allocUnsafeSlow(SLAB_SIZE);
     slabUsed = 0;
@@ -469,7 +471,8 @@ export class GitRepo {
   store(entry) {
     if (this.objects.has(entry.oid)) return;
     const z = entry.z === null ? null : stash(entry.z);
-    const raw = entry.t === T_BLOB && z !== null ? null : stash(entry.d);
+    // entry.d is the reader's own inflate output: a large one is kept as it is, not copied again
+    const raw = entry.t === T_BLOB && z !== null ? null : entry.d.length > SLAB_LIMIT ? entry.d : stash(entry.d);
     this.objects.set(entry.oid, new StoredObject(entry.t, entry.d.length, raw, z));
   }
 
