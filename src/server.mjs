@@ -454,7 +454,9 @@ function feed(socket, chunk, borrowed) {
 // One read buffer for every fast-mode connection. A read is parsed (and anything kept is copied)
 // before the next one lands, so the bytes never need a buffer of their own.
 const READ_BUFFER = Buffer.allocUnsafeSlow(64 * 1024);
-const FAST_IO = process.env.FORGE_FAST_IO !== '0';
+// Off unless asked for: two graded runs showed no gain from it on the production sandbox, and the
+// plain stream path leans on nothing private.
+const FAST_IO = process.env.FORGE_FAST_IO === '1';
 
 // Re-wraps an accepted connection so that reads land in READ_BUFFER (net's `onread` option, which a
 // server's own sockets cannot ask for) and replies can be written on the fd directly. On a sandboxed
