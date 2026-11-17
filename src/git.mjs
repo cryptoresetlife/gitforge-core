@@ -391,8 +391,8 @@ export function writePack(objects) {
   const hash = createHash('sha1');
   hash.update(head);
   for (const obj of objects) {
-    if (obj.z === null || obj.z === undefined) obj.z = deflateSync(obj.d, { level: 1 });
-    const eh = packEntryHeader(obj.t, obj.d.length);
+    if (obj.z === null) obj.z = deflateSync(obj.raw, { level: 1 });
+    const eh = packEntryHeader(obj.t, obj.size);
     hash.update(eh);
     hash.update(obj.z);
     parts.push(eh, obj.z);
@@ -406,6 +406,41 @@ export function writePack(objects) {
 // ---------------------------------------------------------------------------------------------
 
 export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+// Object bytes live in large shared slabs instead of one small ArrayBuffer each: a push then leaves
+// no long-lived external allocations behind for the collector to chase.
+const SLAB_SIZE = 1024 * 1024;
+const SLAB_LIMIT = 16 * 1024;
+let slab = Buffer.allocUnsafeSlow(SLAB_SIZE);
+let slabUsed = 0;
+
+function stash(bytes) {
+  const n = bytes.length;
+  if (n > SLAB_LIMIT) return bytes;
+  if (slabUsed + n > SLAB_SIZE) {
+    slab = Buffer.allocUnsafeSlow(SLAB_SIZE);
+    slabUsed = 0;
+  }
+  bytes.copy(slab, slabUsed, 0, n);
+  const out = slab.subarray(slabUsed, slabUsed + n);
+  slabUsed += n;
+  return out;
+}
+
+// One stored object. Blobs that arrived in a pack keep only their zlib bytes (`z`), which is what a
+// later fetch sends; `d` inflates them on the rare read through the API.
+class StoredObject {
+  constructor(t, size, raw, z) {
+    this.t = t;
+    this.size = size;
+    this.raw = raw;
+    this.z = z;
+  }
+
+  get d() {
+    return this.raw !== null ? this.raw : inflateSync(this.z);
+  }
+}
 
 export class GitRepo {
   constructor(defaultBranch = 'main') {
@@ -424,10 +459,18 @@ export class GitRepo {
     return this.objects.get(oid);
   }
 
-  put(type, data, z = null) {
+  put(type, data) {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { t: type, d: data, z });
+    if (!this.objects.has(oid)) this.objects.set(oid, new StoredObject(type, data.length, stash(data), null));
     return oid;
+  }
+
+  // Stores an object parsed out of a pack, under the id the pack reader computed for it.
+  store(entry) {
+    if (this.objects.has(entry.oid)) return;
+    const z = entry.z === null ? null : stash(entry.z);
+    const raw = entry.t === T_BLOB && z !== null ? null : stash(entry.d);
+    this.objects.set(entry.oid, new StoredObject(entry.t, entry.d.length, raw, z));
   }
 
   commit(oid) {
@@ -1119,9 +1162,7 @@ export function receivePack(repo, body) {
   if (pos < body.length) {
     try {
       const entries = readPack(body.subarray(pos), (oid) => repo.get(oid));
-      for (const entry of entries) {
-        if (!repo.objects.has(entry.oid)) repo.objects.set(entry.oid, { t: entry.t, d: entry.d, z: entry.z });
-      }
+      for (const entry of entries) repo.store(entry);
     } catch (err) {
       unpack = err instanceof GitError ? err.message : 'unpacker error';
     }

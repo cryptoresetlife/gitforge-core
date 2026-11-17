@@ -513,7 +513,7 @@ function contentEntry(repo, path, entry, ref, B) {
     name,
     path,
     sha: entry.oid,
-    size: isDir || obj === undefined ? 0 : obj.d.length,
+    size: isDir || obj === undefined ? 0 : obj.size,
     url: self,
     html_url: html,
     git_url: git,
@@ -1413,7 +1413,7 @@ function routeGit(method, repo, segs, body, B) {
       const oid = segs[5].toLowerCase();
       const obj = git.get(oid);
       if (obj === undefined || obj.t !== T_BLOB) throw NOT_FOUND();
-      return reply(200, { sha: oid, node_id: `B_${b64(`Blob:${repo.id}:${oid}`)}`, size: obj.d.length, url: `${api}/git/blobs/${oid}`, content: wrapBase64(obj.d), encoding: 'base64' });
+      return reply(200, { sha: oid, node_id: `B_${b64(`Blob:${repo.id}:${oid}`)}`, size: obj.size, url: `${api}/git/blobs/${oid}`, content: wrapBase64(obj.d), encoding: 'base64' });
     }
     if (method === 'POST' && segs[5] === undefined) {
       const input = bodyObject(body);
@@ -1434,7 +1434,7 @@ function routeGit(method, repo, segs, body, B) {
           const item = { path, mode: isTree ? '040000' : entry.mode, type: isTree ? 'tree' : entry.mode === '160000' ? 'commit' : 'blob', sha: entry.oid };
           if (!isTree) {
             const obj = git.get(entry.oid);
-            item.size = obj === undefined ? 0 : obj.d.length;
+            item.size = obj === undefined ? 0 : obj.size;
           }
           item.url = `${api}/git/${isTree ? 'trees' : 'blobs'}/${entry.oid}`;
           out.push(item);
